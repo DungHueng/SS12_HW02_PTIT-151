@@ -1,0 +1,218 @@
+# BÀI TẬP 2: THIẾT LẬP KẾ HOẠCH B (FALLBACK PATTERN) – BẢO VỆ GIAO DIỆN
+
+## Phần 1 – Phân tích
+
+### 1. Fallback Pattern là gì?
+
+Trong hệ thống StoreX, Homepage gọi đến Banner-Service để lấy banner quảng cáo.
+
+Nếu Banner-Service gặp sự cố, Homepage không nên trả về lỗi `500` hoặc để giao diện bị trống. Thay vào đó, hệ thống sử dụng **Fallback Pattern** để cung cấp một giá trị thay thế.
+
+**Luồng xử lý:**
+
+```text
+Homepage
+   |
+   | gọi Banner-Service
+   v
+Banner-Service
+   |
+   +---- Thành công ------> Trả về banner thật
+   |
+   +---- Có lỗi ----------> Fallback
+                           |
+                           v
+                 "Freeship mọi đơn hàng"
+```
+
+Trong bài này, Resilience4j cung cấp CircuitBreaker để kết hợp với cơ chế Fallback.
+
+### 2. Quy tắc chữ ký của phương thức Fallback
+
+Phương thức Fallback phải tuân thủ quy tắc so với phương thức gốc:
+
+*   Phải nằm trong cùng class với phương thức được bảo vệ bởi `@CircuitBreaker`.
+*   Phải có cùng kiểu dữ liệu trả về.
+*   Phải giữ nguyên toàn bộ tham số của phương thức gốc, theo đúng thứ tự.
+*   Sau các tham số gốc, thêm một tham số `exception` để nhận nguyên nhân lỗi.
+*   Tham số exception có thể sử dụng `Throwable` để bắt được nhiều loại lỗi.
+
+**Ví dụ:**
+
+Phương thức gốc:
+```java
+public String getBanner(String userId)
+```
+
+Thì Fallback tương ứng:
+```java
+private String bannerFallback(String userId, Throwable throwable)
+```
+
+Có thể biểu diễn:
+> Phương thức gốc: `getBanner(String userId)`
+> ↓
+> Fallback: `bannerFallback(String userId, Throwable throwable)`
+
+Ở đây:
+*   `String userId`: được giữ nguyên từ phương thức gốc.
+*   `Throwable throwable`: được thêm vào để biết nguyên nhân khiến phương thức gốc thất bại.
+
+---
+
+## Phần 2 – Thực thi
+
+### 1. Thêm fallbackMethod vào @CircuitBreaker
+
+Phương thức chính được khai báo:
+
+```java
+@CircuitBreaker(
+    name = "bannerService",
+    fallbackMethod = "bannerFallback"
+)
+public String getBanner(String userId) {
+    // Gọi Banner-Service
+    return "Banner từ Banner-Service";
+}
+```
+
+Trong đó, `fallbackMethod = "bannerFallback"` cho Resilience4j biết rằng khi phương thức `getBanner()` xảy ra lỗi hoặc Circuit Breaker đang OPEN thì sẽ chuyển sang gọi `bannerFallback()`.
+
+### 2. Viết phương thức Fallback
+
+Fallback của bài:
+
+```java
+private String bannerFallback(String userId, Throwable throwable) {
+    // xử lý lỗi
+    return "Freeship mọi đơn hàng";
+}
+```
+
+Khi Banner-Service gặp sự cố, thay vì trả lỗi cho người dùng, hệ thống trả về: `"Freeship mọi đơn hàng"`. Nhờ đó Homepage vẫn có nội dung để hiển thị.
+
+### Bẫy dữ liệu
+
+Đề bài yêu cầu không chỉ bắt exception, mà phải xác định nguyên nhân để quản trị viên biết hệ thống đang gặp vấn đề gì. Vì vậy Fallback sử dụng `Throwable throwable`.
+
+**Ví dụ:**
+
+```java
+private String bannerFallback(String userId, Throwable throwable) {
+    log.error(
+            "Banner fallback - userId={}, exceptionType={}",
+            userId,
+            throwable.getClass().getName(),
+            throwable
+    );
+
+    if (throwable instanceof IOException) {
+        log.error("Lỗi mạng IOException");
+    } else if (throwable instanceof CallNotPermittedException) {
+        log.warn("Circuit Breaker đang OPEN");
+    } else {
+        log.error("Lỗi khác");
+    }
+
+    return "Freeship mọi đơn hàng";
+}
+```
+
+#### Trường hợp 1 – Lỗi mạng IOException
+Nếu nguyên nhân là `IOException` thì log: `Lỗi mạng IOException`. Điều này cho quản trị viên biết vấn đề liên quan đến quá trình giao tiếp mạng hoặc dịch vụ bên ngoài.
+
+#### Trường hợp 2 – Circuit Breaker đang OPEN
+Nếu Circuit Breaker đã chuyển sang trạng thái OPEN, Resilience4j có thể phát sinh `CallNotPermittedException`. Khi đó log: `Circuit Breaker đang OPEN`. Điều này khác với lỗi mạng trực tiếp.
+
+**Có thể hình dung:**
+```text
+Banner-Service lỗi nhiều lần
+         ↓
+Circuit Breaker phát hiện tỷ lệ lỗi cao
+         ↓
+Circuit Breaker chuyển sang OPEN
+         ↓
+Không tiếp tục gọi Banner-Service
+         ↓
+CallNotPermittedException
+         ↓
+bannerFallback()
+         ↓
+"Freeship mọi đơn hàng"
+```
+
+---
+
+### Code hoàn chỉnh
+
+```java
+package com.example.bai_02.Service;
+
+import io.github.resilience4j.circuitbreaker.CallNotPermittedException;
+import io.github.resilience4j.circuitbreaker.annotation.CircuitBreaker;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import org.springframework.stereotype.Service;
+
+import java.io.IOException;
+
+@Service
+public class BannerService {
+
+    private static final Logger log =
+            LoggerFactory.getLogger(BannerService.class);
+
+    @CircuitBreaker(
+            name = "bannerService",
+            fallbackMethod = "bannerFallback"
+    )
+    public String getBanner(String userId) {
+        // Giả lập Banner-Service bị lỗi
+        throw new RuntimeException("Banner-Service đang DOWN");
+    }
+
+    private String bannerFallback(String userId, Throwable throwable) {
+        log.error(
+                "Banner fallback - userId={}, exceptionType={}",
+                userId,
+                throwable.getClass().getName(),
+                throwable
+        );
+
+        if (throwable instanceof IOException) {
+            log.error("Lỗi mạng IOException");
+        } else if (throwable instanceof CallNotPermittedException) {
+            log.warn("Circuit Breaker đang OPEN");
+        } else {
+            log.error("Lỗi khác");
+        }
+
+        return "Freeship mọi đơn hàng";
+    }
+}
+```
+
+---
+
+## Kết luận
+
+Bài toán giải quyết được tình huống Banner-Service gặp sự cố nhưng Homepage vẫn hoạt động.
+
+Thay vì:
+```text
+Banner-Service lỗi  →  Homepage  →  500 / giao diện lỗi
+```
+
+Hệ thống chuyển sang:
+```text
+Banner-Service lỗi
+         ↓
+   CircuitBreaker
+         ↓
+      Fallback
+         ↓
+"Freeship mọi đơn hàng"
+         ↓
+Homepage vẫn hiển thị
+```
